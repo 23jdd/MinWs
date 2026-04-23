@@ -37,10 +37,10 @@ func computeAcceptKey(clientKey string) string {
 	// 3. Base64 编码
 	return base64.StdEncoding.EncodeToString(sha1Sum)
 }
-func Upgrade(w http.ResponseWriter, r *http.Request) (bool, error) {
+func Upgrade(w http.ResponseWriter, r *http.Request) (*Client, error) {
 	connection := r.Header.Get("Connection")
 	if !strings.Contains(connection, "Upgrade") {
-		return false, fmt.Errorf("upgrade not supported") //
+		return nil, fmt.Errorf("upgrade not supported") //
 	}
 	hijacker, ok := w.(http.Hijacker)
 	if ok {
@@ -67,31 +67,18 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (bool, error) {
 		// 写入并 Flush
 		_, err = brw.WriteString(response)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		err = brw.Flush()
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		connect := Connect{c: brw}
-		client := Client{
+		connect := NewConnect(1024)
+		connect.c = brw
+		return &Client{
 			con: connect,
-			onOpen: func() {
-
-			},
-			onClose: func() {
-
-			},
-			onError: func(err error) {
-				fmt.Println(err)
-			},
-			onMessage: func(data []byte) {
-
-			},
-		}
-		client.Listen()
-		return true, nil
+		}, nil
 	} else {
-		return false, fmt.Errorf("hijacker not supported")
+		return nil, fmt.Errorf("hijacker not supported")
 	}
 }

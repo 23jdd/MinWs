@@ -2,107 +2,284 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/binary"
-	"fmt"
 	"io"
+	"sync"
+)
+
+// WebSocket 常量定义
+const (
+	OpcodeContinuation = 0x0
+	OpcodeText         = 0x1
+	OpcodeBinary       = 0x2
+	OpcodeClose        = 0x8
+	OpcodePing         = 0x9
+	OpcodePong         = 0xA
 )
 
 type FrameHeader struct {
-	Fin    bool  // 0-1
-	Opcode byte  //
-	Masked bool  //
-	Length int64 //
+	Fin    bool
+	Opcode byte
+	Masked bool
+	Length uint64
 }
-type FramePreLoad struct {
+
+type Connect struct {
+	c     *bufio.ReadWriter
+	spool sync.Pool //    8 bytes
+	bpool sync.Pool //   1024 bytes
+	agg   *Aggregator
 }
+
 type Client struct {
-	con       Connect
+	con       *Connect
 	onOpen    func()
 	onClose   func()
 	onError   func(err error)
 	onMessage func(data []byte)
 }
-type Connect struct {
-	c *bufio.ReadWriter
+
+func NewConnect(maxsize uint) *Connect {
+	c := &Connect{}
+	c.spool.New = func() interface{} {
+		return make([]byte, 8)
+	}
+	c.bpool.New = func() interface{} {
+		return make([]byte, 1024)
+	}
+	c.agg = NewAggregator(maxsize)
+	return c
 }
 
+// Listen 持续监听并解析入站帧
 func (c *Client) Listen() {
 	go func() {
+		if c.onOpen != nil {
+			c.onOpen()
+		}
 		for {
 			header, err := c.con.ReadHeader()
-			fmt.Println("Read header:", header)
 			if err != nil {
-				c.onError(err)
+				if err != io.EOF {
+					if c.onError != nil {
+						c.onError(err)
+					}
+				}
 				return
 			}
-			err = c.con.ReadPreLoad(header)
+
+			payload, err := c.con.ReadPayload(header)
 			if err != nil {
-				c.onError(err)
+				if c.onError != nil {
+					c.onError(err)
+				}
+				continue
+			}
+
+			// 处理控制帧或分发消息
+			switch header.Opcode {
+			case OpcodePing:
+				c.Pong(payload)
+			case OpcodeClose:
+				if c.onClose != nil {
+					c.onClose()
+				}
+				return
+			case OpcodeContinuation:
+				if !c.con.agg.started {
+					continue
+				}
+				if header.Fin {
+					err := c.con.agg.Received(payload)
+					c.con.agg.started = false
+					if err != nil {
+						if c.onError != nil {
+							c.onError(err)
+						}
+						c.con.agg.Clear()
+						continue
+					}
+					if c.con.agg.len == 0 {
+						c.onMessage(nil)
+					} else {
+						c.onMessage(c.con.agg.buf[:c.con.agg.len])
+					}
+				} else {
+					err := c.con.agg.Received(payload)
+					if err != nil {
+						if c.onError != nil {
+							c.onError(err)
+						}
+						c.con.agg.Clear()
+						c.con.agg.started = false
+						continue
+					}
+				}
+			case OpcodeText, OpcodeBinary:
+				{
+					if c.con.agg.started {
+						continue
+					}
+					//  A frame
+					if header.Fin {
+						if c.onMessage != nil {
+							c.onMessage(payload)
+						}
+						continue
+					}
+					err := c.con.agg.Received(payload)
+					if err != nil {
+						if c.onError != nil {
+							c.onError(err)
+						}
+						c.con.agg.Clear()
+						continue
+					}
+					c.con.agg.started = true
+				}
 			}
 		}
-
 	}()
 }
-func Decode(mask uint32, data []byte) []byte {
-	result := make([]byte, len(data))
-	for index, v := range data {
-		switch index % 4 {
-		case 0:
-			result[index] = v ^ byte(mask>>24)
-		case 1:
-			result[index] = v ^ byte(mask>>16)
-		case 2:
-			result[index] = v ^ byte(mask>>8)
-		case 3:
-			result[index] = v ^ byte(mask)
-		}
-	}
-	return result
-}
 
-type Frame struct {
-	header FrameHeader
-}
-
-func (c *Client) Connect() error {
-	return nil
-}
-
-// 0000 0000 0000 0000
-func NewFrameHeader(data uint16) FrameHeader {
-	fin := data & 0x8000
-	header := FrameHeader{}
-	if fin > 0 {
-		header.Fin = true
-	}
-	//  0000 0000 0000 0000
-	header.Opcode = byte((data & 0x0F00) >> 8)
-	header.Masked = true
-	// 1 7
-	header.Length = int64(data & 0x007F)
-	return header
-}
+// ReadHeader 解析报头
 func (c *Connect) ReadHeader() (*FrameHeader, error) {
-	buffer := make([]byte, 2) //TODO  sync.pool
-	_, err := io.ReadFull(c.c, buffer)
-	if err != nil {
+	pool := c.spool.Get()
+	defer c.spool.Put(pool)
+	buf := pool.([]byte)[:2]
+	if _, err := io.ReadFull(c.c, buf); err != nil {
 		return nil, err
 	}
-	frameHeader := NewFrameHeader(binary.BigEndian.Uint16(buffer))
-	return &frameHeader, nil
+	header := &FrameHeader{
+		Fin:    (buf[0] & 0x80) != 0,
+		Opcode: buf[0] & 0x0F,
+		Masked: (buf[1] & 0x80) != 0,
+		Length: uint64(buf[1] & 0x7F),
+	}
+	// 处理长度扩展
+	if header.Length == 126 {
+		pool := c.spool.Get()
+		defer c.spool.Put(pool)
+		lenBuf := pool.([]byte)[:2] // TODO sync.pool
+		if _, err := io.ReadFull(c.c, lenBuf); err != nil {
+			return nil, err
+		}
+		header.Length = uint64(binary.BigEndian.Uint16(lenBuf))
+	} else if header.Length == 127 {
+		pool := c.spool.Get()
+		defer c.spool.Put(pool)
+		lenBuf := pool.([]byte) // TODO sync.pool
+		if _, err := io.ReadFull(c.c, lenBuf); err != nil {
+			return nil, err
+		}
+		header.Length = binary.BigEndian.Uint64(lenBuf)
+	}
+	return header, nil
 }
-func (c *Connect) ReadPreLoad(header *FrameHeader) error {
-	b_4 := make([]byte, 4)
-	_, err := io.ReadFull(c.c, b_4)
-	if err != nil {
+
+// ReadPayload 读取并解密负载数据
+func (c *Connect) ReadPayload(header *FrameHeader) ([]byte, error) {
+	var maskKey []byte
+	if header.Masked {
+		pool := c.spool.Get()
+		defer c.spool.Put(pool)
+		maskKey = pool.([]byte)[:4] //sync pool
+		if _, err := io.ReadFull(c.c, maskKey); err != nil {
+			return nil, err
+		}
+	}
+
+	payload := make([]byte, header.Length) //1024
+	if _, err := io.ReadFull(c.c, payload); err != nil {
+
+		return nil, err
+	}
+
+	if header.Masked {
+		Mask(payload, maskKey)
+	}
+
+	return payload, nil
+}
+
+// WriteFrame 构建并发送 WebSocket 帧
+func (c *Connect) WriteFrame(opcode byte, isMasked bool, data []byte) error {
+	var header []byte
+	length := len(data)
+	// 1. 第一个字节 (Fin=1 + Opcode)
+	header = append(header, 0x80|opcode)
+
+	// 2. 长度和 Mask 标志位
+	maskBit := byte(0)
+	if isMasked {
+		maskBit = 0x80
+	}
+
+	if length <= 125 {
+		header = append(header, maskBit|byte(length))
+	} else if length <= 65535 {
+		header = append(header, maskBit|126)
+		extLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(extLen, uint16(length))
+		header = append(header, extLen...)
+	} else {
+		header = append(header, maskBit|127)
+		extLen := make([]byte, 8)
+		binary.BigEndian.PutUint64(extLen, uint64(length))
+		header = append(header, extLen...)
+	}
+
+	// 3. 处理 Masking Key 和加密
+	if isMasked {
+		maskKey := make([]byte, 4)
+		if _, err := io.ReadFull(rand.Reader, maskKey); err != nil {
+			return err
+		}
+		header = append(header, maskKey...)
+
+		// 为了不破坏原数据，拷贝一份进行处理
+		maskedData := make([]byte, length)
+		copy(maskedData, data)
+		Mask(maskedData, maskKey)
+		data = maskedData
+	}
+
+	// 4. 发送 Header + Payload
+	if _, err := c.c.Write(header); err != nil {
 		return err
 	}
-	buffer := make([]byte, header.Length)
-	_, err = io.ReadFull(c.c, buffer)
-	if err != nil {
+	if _, err := c.c.Write(data); err != nil {
 		return err
 	}
-	decode := Decode(binary.BigEndian.Uint32(b_4), buffer)
-	fmt.Println(string(decode))
-	return nil
+	return c.c.Flush()
+}
+
+// Mask 统一掩码算法 (原地异或，高效)
+func Mask(data []byte, key []byte) {
+	for i := 0; i < len(data); i++ {
+		data[i] ^= key[i%4]
+	}
+}
+
+// --- Client 暴露的方法 ---
+
+func (client *Client) SendText(text string) {
+	_ = client.con.WriteFrame(OpcodeText, false, []byte(text))
+}
+
+func (client *Client) SendBinary(data []byte) {
+	_ = client.con.WriteFrame(OpcodeBinary, false, data)
+}
+
+func (client *Client) Ping() {
+	_ = client.con.WriteFrame(OpcodePing, false, nil)
+}
+
+func (client *Client) Pong(pingPayload []byte) {
+	_ = client.con.WriteFrame(OpcodePong, true, pingPayload)
+}
+
+func (client *Client) Close() {
+	_ = client.con.WriteFrame(OpcodeClose, true, nil)
 }
