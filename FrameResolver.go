@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"sync"
 )
@@ -26,18 +27,19 @@ type FrameHeader struct {
 }
 
 type Connect struct {
-	c     *bufio.ReadWriter
-	spool sync.Pool //    8 bytes
-	bpool sync.Pool //   1024 bytes
-	agg   *Aggregator
+	c          *bufio.ReadWriter
+	spool      sync.Pool //    8 bytes
+	agg        *Aggregator
+	mu         sync.Mutex
+	maxPayload uint64
 }
 
 type Client struct {
 	con       *Connect
-	onOpen    func()
-	onClose   func()
-	onError   func(err error)
-	onMessage func(data []byte)
+	OnOpen    func()
+	OnClose   func()
+	OnError   func(err error)
+	OnMessage func(data []byte)
 }
 
 func NewConnect(maxsize uint) *Connect {
@@ -45,25 +47,22 @@ func NewConnect(maxsize uint) *Connect {
 	c.spool.New = func() interface{} {
 		return make([]byte, 8)
 	}
-	c.bpool.New = func() interface{} {
-		return make([]byte, 1024)
-	}
 	c.agg = NewAggregator(maxsize)
+	c.maxPayload = uint64(maxsize)
 	return c
 }
 
-// Listen 持续监听并解析入站帧
 func (c *Client) Listen() {
 	go func() {
-		if c.onOpen != nil {
-			c.onOpen()
+		if c.OnOpen != nil {
+			c.OnOpen()
 		}
 		for {
 			header, err := c.con.ReadHeader()
 			if err != nil {
 				if err != io.EOF {
-					if c.onError != nil {
-						c.onError(err)
+					if c.OnError != nil {
+						c.OnError(err)
 					}
 				}
 				return
@@ -71,8 +70,8 @@ func (c *Client) Listen() {
 
 			payload, err := c.con.ReadPayload(header)
 			if err != nil {
-				if c.onError != nil {
-					c.onError(err)
+				if c.OnError != nil {
+					c.OnError(err)
 				}
 				continue
 			}
@@ -82,62 +81,68 @@ func (c *Client) Listen() {
 			case OpcodePing:
 				c.Pong(payload)
 			case OpcodeClose:
-				if c.onClose != nil {
-					c.onClose()
+				if c.OnClose != nil {
+					c.OnClose()
 				}
+				c.Close()
 				return
 			case OpcodeContinuation:
 				if !c.con.agg.started {
 					continue
 				}
+				err := c.con.agg.Received(payload)
+				if err != nil {
+					if c.OnError != nil {
+						c.OnError(err)
+					}
+					c.con.agg.Clear()
+					continue
+				}
 				if header.Fin {
-					err := c.con.agg.Received(payload)
-					c.con.agg.started = false
-					if err != nil {
-						if c.onError != nil {
-							c.onError(err)
+					opcode := c.con.agg.opcode
+					data := c.con.agg.buf[:c.con.agg.len]
+					c.con.agg.Clear()
+					if opcode == OpcodeText && !IsValidUtf8(data) {
+						if c.OnError != nil {
+							c.OnError(errors.New("invalid utf8 payload"))
 						}
-						c.con.agg.Clear()
-						continue
+						c.Close()
+						return
 					}
-					if c.con.agg.len == 0 {
-						c.onMessage(nil)
+					if len(data) == 0 {
+						c.OnMessage(nil)
 					} else {
-						c.onMessage(c.con.agg.buf[:c.con.agg.len])
-					}
-				} else {
-					err := c.con.agg.Received(payload)
-					if err != nil {
-						if c.onError != nil {
-							c.onError(err)
-						}
-						c.con.agg.Clear()
-						c.con.agg.started = false
-						continue
+						c.OnMessage(data)
 					}
 				}
 			case OpcodeText, OpcodeBinary:
-				{
-					if c.con.agg.started {
-						continue
-					}
-					//  A frame
-					if header.Fin {
-						if c.onMessage != nil {
-							c.onMessage(payload)
-						}
-						continue
-					}
-					err := c.con.agg.Received(payload)
-					if err != nil {
-						if c.onError != nil {
-							c.onError(err)
-						}
-						c.con.agg.Clear()
-						continue
-					}
-					c.con.agg.started = true
+				if c.con.agg.started {
+					continue
 				}
+				//  A frame
+				if header.Fin {
+					if header.Opcode == OpcodeText && !IsValidUtf8(payload) {
+						if c.OnError != nil {
+							c.OnError(errors.New("invalid utf8 payload"))
+						}
+						c.Close()
+						return
+					}
+					if c.OnMessage != nil {
+						c.OnMessage(payload)
+					}
+					continue
+				}
+				err := c.con.agg.Received(payload)
+				if err != nil {
+					if c.OnError != nil {
+						c.OnError(err)
+					}
+					c.con.agg.Clear()
+					continue
+				}
+				c.con.agg.opcode = header.Opcode
+				c.con.agg.started = true
 			}
 		}
 	}()
@@ -157,11 +162,22 @@ func (c *Connect) ReadHeader() (*FrameHeader, error) {
 		Masked: (buf[1] & 0x80) != 0,
 		Length: uint64(buf[1] & 0x7F),
 	}
+	if buf[0]&0x70 != 0 {
+		return nil, errors.New("RSV bits must be 0")
+	}
+	if header.Opcode >= 0x8 {
+		if !header.Fin {
+			return nil, errors.New("control frame must not be fragmented")
+		}
+		if header.Length > 125 {
+			return nil, errors.New("control frame payload too large")
+		}
+	}
 	// 处理长度扩展
 	if header.Length == 126 {
 		pool := c.spool.Get()
 		defer c.spool.Put(pool)
-		lenBuf := pool.([]byte)[:2] // TODO sync.pool
+		lenBuf := pool.([]byte)[:2]
 		if _, err := io.ReadFull(c.c, lenBuf); err != nil {
 			return nil, err
 		}
@@ -169,11 +185,14 @@ func (c *Connect) ReadHeader() (*FrameHeader, error) {
 	} else if header.Length == 127 {
 		pool := c.spool.Get()
 		defer c.spool.Put(pool)
-		lenBuf := pool.([]byte) // TODO sync.pool
+		lenBuf := pool.([]byte)
 		if _, err := io.ReadFull(c.c, lenBuf); err != nil {
 			return nil, err
 		}
 		header.Length = binary.BigEndian.Uint64(lenBuf)
+	}
+	if header.Length > c.maxPayload {
+		return nil, errors.New("payload too large")
 	}
 	return header, nil
 }
@@ -205,6 +224,8 @@ func (c *Connect) ReadPayload(header *FrameHeader) ([]byte, error) {
 
 // WriteFrame 构建并发送 WebSocket 帧
 func (c *Connect) WriteFrame(opcode byte, isMasked bool, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var header []byte
 	length := len(data)
 	// 1. 第一个字节 (Fin=1 + Opcode)
@@ -277,9 +298,9 @@ func (client *Client) Ping() {
 }
 
 func (client *Client) Pong(pingPayload []byte) {
-	_ = client.con.WriteFrame(OpcodePong, true, pingPayload)
+	_ = client.con.WriteFrame(OpcodePong, false, pingPayload)
 }
 
 func (client *Client) Close() {
-	_ = client.con.WriteFrame(OpcodeClose, true, nil)
+	_ = client.con.WriteFrame(OpcodeClose, false, nil)
 }

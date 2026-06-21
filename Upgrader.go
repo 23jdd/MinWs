@@ -8,9 +8,6 @@ import (
 	"strings"
 )
 
-// [1 0 0 0 0 0 0 1 ]
-// [1 1 0 1 0 0 0 1 ] 1+
-// real [1 0 0 0 0 0 0 1] 1 1 0 1 0 0 0 1
 func BitFormat(b byte) string {
 	var bits [8]string
 	for i := 0; i < 8; i++ {
@@ -42,13 +39,26 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Client, error) {
 	if !strings.Contains(connection, "Upgrade") {
 		return nil, fmt.Errorf("upgrade not supported") //
 	}
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return nil, fmt.Errorf("upgrade header must be websocket")
+	}
+	if r.Header.Get("Sec-WebSocket-Version") != "13" {
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		http.Error(w, "Upgrade Required", http.StatusUpgradeRequired)
+		return nil, fmt.Errorf("unsupported websocket version")
+	}
+	if r.Header.Get("Sec-WebSocket-Key") == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return nil, fmt.Errorf("missing Sec-WebSocket-Key")
+	}
 	hijacker, ok := w.(http.Hijacker)
 	if ok {
 		_, brw, err := hijacker.Hijack()
 		if err != nil {
 			panic(err)
 		}
-		// 假设你已经通过 Hijack 拿到了 brw (*bufio.ReadWriter)
+		// 通过 Hijack 拿到了 brw (*bufio.ReadWriter)
 		acceptKey := computeAcceptKey(r.Header.Get("Sec-WebSocket-Key"))
 
 		// 构造响应头

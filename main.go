@@ -12,7 +12,8 @@ func main() {
 			fmt.Println(err)
 			return
 		}
-		client.onMessage = func(data []byte) {
+		// register message
+		client.OnMessage = func(data []byte) {
 			client.SendText(string(data)) //
 			fmt.Println(string(data))
 		}

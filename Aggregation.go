@@ -8,6 +8,7 @@ type Aggregator struct {
 	len     int
 	buf     []byte
 	started bool
+	opcode  byte
 }
 
 func NewAggregator(maxsize uint) *Aggregator {
@@ -28,4 +29,6 @@ func (a *Aggregator) Received(data []byte) error {
 }
 func (a *Aggregator) Clear() {
 	a.len = 0
+	a.started = false
+	a.opcode = 0
 }
