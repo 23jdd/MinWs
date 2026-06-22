@@ -69,6 +69,11 @@ func NewConnect(maxsize uint) *Connect {
 
 func (c *Client) Listen() {
 	go func() {
+		defer func() {
+			if c.OnClose != nil {
+				c.OnClose()
+			}
+		}()
 		if c.OnOpen != nil {
 			c.OnOpen()
 		}
@@ -97,9 +102,6 @@ func (c *Client) Listen() {
 				c.Pong(payload)
 			case OpcodeClose:
 				_, _, perr := parseClosePayload(payload)
-				if c.OnClose != nil {
-					c.OnClose()
-				}
 				if perr != nil {
 					_ = c.CloseWith(CloseProtocolError, "")
 				} else {
