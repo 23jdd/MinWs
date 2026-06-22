@@ -9,16 +9,13 @@ import (
 )
 
 func computeAcceptKey(clientKey string) string {
-	// 1. 拼接
 	const magicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	fullString := clientKey + magicString
 
-	// 2. SHA-1 哈希
 	h := sha1.New()
 	h.Write([]byte(fullString))
 	sha1Sum := h.Sum(nil)
 
-	// 3. Base64 编码
 	return base64.StdEncoding.EncodeToString(sha1Sum)
 }
 func Upgrade(w http.ResponseWriter, r *http.Request) (*Client, error) {
@@ -45,10 +42,9 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Client, error) {
 		if err != nil {
 			panic(err)
 		}
-		// 通过 Hijack 拿到了 brw (*bufio.ReadWriter)
+
 		acceptKey := computeAcceptKey(r.Header.Get("Sec-WebSocket-Key"))
 
-		// 构造响应头
 		response := "HTTP/1.1 101 Switching Protocols\r\n" +
 			"Upgrade: websocket\r\n" +
 			"Connection: Upgrade\r\n" +
