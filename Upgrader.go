@@ -8,19 +8,6 @@ import (
 	"strings"
 )
 
-func BitFormat(b byte) string {
-	var bits [8]string
-	for i := 0; i < 8; i++ {
-		// Check bit from MSB (7) to LSB (0)
-		if b&(1<<(7-i)) != 0 {
-			bits[i] = "1"
-		} else {
-			bits[i] = "0"
-		}
-	}
-	return fmt.Sprintf("b7 b6 b5 b4 b3 b2 b1 b0\n%s  %s  %s  %s  %s  %s  %s  %s",
-		bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7])
-}
 func computeAcceptKey(clientKey string) string {
 	// 1. 拼接
 	const magicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

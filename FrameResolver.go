@@ -19,6 +19,20 @@ const (
 	OpcodePong         = 0xA
 )
 
+// Close 状态码 (RFC 6455 §7.4.1)
+const (
+	CloseNormalClosure           uint16 = 1000
+	CloseGoingAway               uint16 = 1001
+	CloseProtocolError           uint16 = 1002
+	CloseUnsupportedData         uint16 = 1003
+	CloseNoStatusReceived        uint16 = 1005
+	CloseInvalidFramePayloadData uint16 = 1007
+	ClosePolicyViolation         uint16 = 1008
+	CloseMessageTooBig           uint16 = 1009
+	CloseMandatoryExtension      uint16 = 1010
+	CloseInternalServerErr       uint16 = 1011
+)
+
 type FrameHeader struct {
 	Fin    bool
 	Opcode byte
@@ -44,6 +58,7 @@ type Client struct {
 
 func NewConnect(maxsize uint) *Connect {
 	c := &Connect{}
+	// init sync.pool
 	c.spool.New = func() interface{} {
 		return make([]byte, 8)
 	}
@@ -81,10 +96,15 @@ func (c *Client) Listen() {
 			case OpcodePing:
 				c.Pong(payload)
 			case OpcodeClose:
+				_, _, perr := parseClosePayload(payload)
 				if c.OnClose != nil {
 					c.OnClose()
 				}
-				c.Close()
+				if perr != nil {
+					_ = c.CloseWith(CloseProtocolError, "")
+				} else {
+					_ = c.CloseWith(CloseNormalClosure, "")
+				}
 				return
 			case OpcodeContinuation:
 				if !c.con.agg.started {
@@ -106,7 +126,7 @@ func (c *Client) Listen() {
 						if c.OnError != nil {
 							c.OnError(errors.New("invalid utf8 payload"))
 						}
-						c.Close()
+						_ = c.CloseWith(CloseInvalidFramePayloadData, "")
 						return
 					}
 					if len(data) == 0 {
@@ -125,7 +145,7 @@ func (c *Client) Listen() {
 						if c.OnError != nil {
 							c.OnError(errors.New("invalid utf8 payload"))
 						}
-						c.Close()
+						_ = c.CloseWith(CloseInvalidFramePayloadData, "")
 						return
 					}
 					if c.OnMessage != nil {
@@ -302,5 +322,54 @@ func (client *Client) Pong(pingPayload []byte) {
 }
 
 func (client *Client) Close() {
-	_ = client.con.WriteFrame(OpcodeClose, false, nil)
+	_ = client.CloseWith(CloseNormalClosure, "")
+}
+
+// CloseWith 发送带状态码和原因的 Close 帧
+func (client *Client) CloseWith(code uint16, reason string) error {
+	if code == 0 || code == CloseNoStatusReceived {
+		return client.con.WriteFrame(OpcodeClose, false, nil)
+	}
+	r := []byte(reason)
+	if len(r) > 123 {
+		r = r[:123]
+	}
+	payload := make([]byte, 2+len(r))
+	binary.BigEndian.PutUint16(payload, code)
+	copy(payload[2:], r)
+	return client.con.WriteFrame(OpcodeClose, false, payload)
+}
+
+// parseClosePayload 解析对端 Close 帧负载, 返回状态码与原因
+func parseClosePayload(payload []byte) (uint16, string, error) {
+	if len(payload) == 0 {
+		return CloseNoStatusReceived, "", nil
+	}
+	if len(payload) == 1 {
+		return 0, "", errors.New("invalid close payload length")
+	}
+	code := binary.BigEndian.Uint16(payload[:2])
+	reason := payload[2:]
+	if !IsValidUtf8(reason) {
+		return 0, "", errors.New("invalid utf8 in close reason")
+	}
+	if !isValidCloseCode(code) {
+		return 0, "", errors.New("invalid close code")
+	}
+	return code, string(reason), nil
+}
+
+func isValidCloseCode(code uint16) bool {
+	switch {
+	case code >= 3000 && code <= 4999:
+		return true
+	case code == CloseNormalClosure, code == CloseGoingAway,
+		code == CloseProtocolError, code == CloseUnsupportedData,
+		code == CloseInvalidFramePayloadData, code == ClosePolicyViolation,
+		code == CloseMessageTooBig, code == CloseMandatoryExtension,
+		code == CloseInternalServerErr:
+		return true
+	default:
+		return false
+	}
 }
